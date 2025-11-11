@@ -221,6 +221,12 @@ def parse_args(argv):
         help="Save text statistics to the specified JSON file",
     )
     text_stats.add_argument(
+        "--image-bytes-per-token",
+        type=float,
+        default=0.0,
+        help="Optional: conversion rate to estimate image tokens from bytes (e.g., 3.0). 0 disables estimation.",
+    )
+    text_stats.add_argument(
         "--use-tiktoken",
         action="store_true",
         help="Use tiktoken for token counting (fallback to heuristic if not available)",
@@ -269,6 +275,9 @@ if __name__ == "__main__":
         total_words = 0
         total_cells_with_text = 0
         total_tokens = 0
+        # Image bytes from xl/media without extracting
+        total_image_files = 0
+        total_image_bytes = 0
 
         encoder = None
         if getattr(args, "use_tiktoken", False):
@@ -309,14 +318,43 @@ if __name__ == "__main__":
             total_words += sheet_words
             total_tokens += sheet_tokens
 
+        # Accumulate image bytes from the XLSX archive's xl/media directory
+        try:
+            with zipfile.ZipFile(args.xlsx) as zf:
+                media_names = [n for n in zf.namelist() if n.startswith("xl/media/")]
+                for name in media_names:
+                    try:
+                        info = zf.getinfo(name)
+                        total_image_files += 1
+                        total_image_bytes += getattr(info, "file_size", 0)
+                    except KeyError:
+                        continue
+        except Exception as e:
+            logger.warning("Failed to inspect xl/media for image bytes: %s", e)
+
+        est_image_tokens = None
+        if args.image_bytes_per_token and args.image_bytes_per_token > 0:
+            est_image_tokens = int(total_image_bytes / args.image_bytes_per_token)
+
         report = {
             "file": str(args.xlsx),
             "sheets": per_sheet,
-            "totals": {
+            "totals_text": {
                 "total_cells_with_text": total_cells_with_text,
                 "total_chars": total_chars,
                 "total_words": total_words,
                 "total_est_tokens": total_tokens,
+            },
+            "images": {
+                "total_image_files": total_image_files,
+                "total_image_bytes": total_image_bytes,
+                "est_image_tokens": est_image_tokens,
+                "image_bytes_per_token": args.image_bytes_per_token if args.image_bytes_per_token else None,
+            },
+            "totals_overall": {
+                "total_est_tokens_text": total_tokens,
+                "total_est_image_tokens": est_image_tokens,
+                "total_est_tokens_combined": (total_tokens + (est_image_tokens or 0)),
             },
             "token_method": "tiktoken" if encoder else "heuristic_4chars_per_token",
         }
