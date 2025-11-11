@@ -147,6 +147,7 @@ def extract_images_xlsx(xlsx_path, out_dir):
     # 1) Try via openpyxl API
     wb = load_workbook(xlsx_path, data_only=True)
     results = []
+    processed_files = set()  # Track files that have been processed via API
 
     for worksheet in wb.worksheets:
         logger.info("Обработка листа: %s", worksheet.title)
@@ -183,6 +184,7 @@ def extract_images_xlsx(xlsx_path, out_dir):
 
             if raw_bytes:
                 out_file.write_bytes(raw_bytes)
+                processed_files.add(out_file.name)  # Track this file
                 logger.debug("Сохранено изображение: %s", out_file)
             else:
                 logger.warning("Не удалось получить байты изображения для %s", file_name)
@@ -199,14 +201,23 @@ def extract_images_xlsx(xlsx_path, out_dir):
         media_files = [name for name in archive.namelist() if name.startswith("xl/media/")]
         logger.info("Файлов в xl/media/: %d", len(media_files))
         for media_name in media_files:
-            target = out / Path(media_name).name
-            if not target.exists():
+            target_file_name = Path(media_name).name
+            target = out / target_file_name
+            existed = target.exists()
+            
+            # Skip if this file was already processed via openpyxl API
+            if target_file_name in processed_files:
+                logger.debug("Медиа-файл %s уже обработан через API, пропуск", target_file_name)
+                continue
+                
+            if not existed:
                 with archive.open(media_name) as source, open(target, "wb") as destination:
                     shutil.copyfileobj(source, destination)
                 logger.debug("Добавлен медиа-файл из архива: %s", target)
-                results.append({"sheet": None, "cell": None, "file": str(target), "ok": True})
             else:
-                logger.debug("Медиа-файл уже существует, пропуск: %s", target)
+                logger.debug("Медиа-файл уже существует, индексируем: %s", target)
+            # Always add to results, even if file already existed
+            results.append({"sheet": None, "cell": None, "file": str(target), "ok": True, "existed": existed})
 
     logger.info("Завершено. Всего записей в результатах: %d", len(results))
     return results
