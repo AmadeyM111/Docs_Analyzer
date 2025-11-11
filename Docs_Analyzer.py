@@ -28,6 +28,31 @@ def _estimate_tokens_heuristic(text: str, chars_per_token: float = 3.0) -> int:
     return max(1, int(len(text) / chars_per_token))
 
 
+def _make_json_serializable(obj):
+    """
+    Recursively convert non-JSON-serializable objects (bytes, etc.) to JSON-compatible types.
+    """
+    if isinstance(obj, bytes):
+        # Convert bytes to base64 string for readability
+        try:
+            return base64.b64encode(obj).decode('utf-8')
+        except Exception:
+            # Fallback to hex if base64 fails
+            return obj.hex()
+    elif isinstance(obj, dict):
+        return {key: _make_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_make_json_serializable(item) for item in obj]
+    elif isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+    else:
+        # For other types, try to convert to string
+        try:
+            return str(obj)
+        except Exception:
+            return None
+
+
 def _compute_sha256(file_path: Path) -> str:
     hasher = hashlib.sha256()
     with open(file_path, "rb") as f:
@@ -411,16 +436,19 @@ if __name__ == "__main__":
     total_fail = total - total_ok
     print(f"Итог: найдено {total} элементов, сохранено успешно: {total_ok}, ошибок: {total_fail}")
 
+    # Make results JSON-serializable (convert bytes, etc.)
+    serializable_results = _make_json_serializable(enriched_results)
+
     # Запись в JSON-файл, если указан --out-json
     if getattr(args, "out_json", None):
         out_json_path = Path(args.out_json)
         out_json_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_json_path, "w", encoding="utf-8") as f:
-            json.dump(enriched_results, f, ensure_ascii=False, indent=2)
+            json.dump(serializable_results, f, ensure_ascii=False, indent=2)
         print(f"JSON сохранён: {out_json_path}")
 
     if args.json:
-        print(json.dumps(enriched_results, ensure_ascii=False, indent=2))
+        print(json.dumps(serializable_results, ensure_ascii=False, indent=2))
     else:
         # Краткий табличный вывод
         print("sheet\tcell\tfile\tok")
