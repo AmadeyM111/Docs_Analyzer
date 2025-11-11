@@ -20,6 +20,13 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _estimate_tokens_heuristic(text: str) -> int:
+    # Rough heuristic: ~4 characters per token (English-centric; configurable)
+    if not text:
+        return 0
+    return max(1, int(len(text) / 4))
+
+
 def _compute_sha256(file_path: Path) -> str:
     hasher = hashlib.sha256()
     with open(file_path, "rb") as f:
@@ -180,24 +187,65 @@ def extract_images_xlsx(xlsx_path, out_dir):
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Извлечение изображений из XLSX.")
-    parser.add_argument("--xlsx", required=True, help="Путь к XLSX файлу")
-    parser.add_argument("--out", required=True, help="Директория для сохранения изображений")
+    parser = argparse.ArgumentParser(description="XLSX analyzer CLI (images extraction and text stats).")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Common option
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
-        help="Уровень логирования (по умолчанию: INFO)",
+        help="Logging level (default: INFO)",
     )
-    parser.add_argument(
+
+    # Images subcommand (backward compatible defaults)
+    images = subparsers.add_parser("images", help="Extract images and generate report")
+    images.add_argument("--xlsx", required=False, help="Path to XLSX file")
+    images.add_argument("--out", required=False, help="Directory to save extracted images")
+    images.add_argument(
         "--json",
         action="store_true",
-        help="Печатать результаты в формате JSON",
+        help="Print results as JSON to stdout",
     )
-    parser.add_argument(
+    images.add_argument(
         "--out-json",
-        help="Сохранить результаты в указанный JSON-файл",
+        help="Save results to the specified JSON file",
     )
+
+    # Text stats subcommand
+    text_stats = subparsers.add_parser("text-stats", help="Compute text statistics per sheet and totals")
+    text_stats.add_argument("--xlsx", required=True, help="Path to XLSX file")
+    text_stats.add_argument(
+        "--out-json",
+        required=True,
+        help="Save text statistics to the specified JSON file",
+    )
+    text_stats.add_argument(
+        "--use-tiktoken",
+        action="store_true",
+        help="Use tiktoken for token counting (fallback to heuristic if not available)",
+    )
+    text_stats.add_argument(
+        "--encoding",
+        default="cl100k_base",
+        help="tiktoken encoding name (default: cl100k_base)",
+    )
+
+    # If no subcommand provided, maintain backward compatibility with images mode
+    # by parsing top-level args as images defaults.
+    # Detect legacy pattern: user passed --xlsx/--out at top level
+    if argv and not any(arg in ("images", "text-stats") for arg in argv):
+        # parse a legacy-style set of flags by temporarily creating a minimal parser
+        legacy = argparse.ArgumentParser(add_help=False)
+        legacy.add_argument("--xlsx")
+        legacy.add_argument("--out")
+        legacy.add_argument("--json", action="store_true")
+        legacy.add_argument("--out-json")
+        known, _ = legacy.parse_known_args(argv)
+        if known.xlsx or known.out:
+            # inject "images" subcommand
+            argv = ["images"] + argv
+
     return parser.parse_args(argv)
 
 
@@ -213,8 +261,79 @@ if __name__ == "__main__":
     args = parse_args(sys.argv[1:])
     configure_logging(args.log_level)
 
-    xlsx_path = args.xlsx
-    output_dir = args.out
+    if getattr(args, "command", None) == "text-stats":
+        # Text statistics workflow
+        wb = load_workbook(args.xlsx, data_only=True)
+        per_sheet = []
+        total_chars = 0
+        total_words = 0
+        total_cells_with_text = 0
+        total_tokens = 0
+
+        encoder = None
+        if getattr(args, "use_tiktoken", False):
+            try:
+                import tiktoken  # type: ignore
+                encoder = tiktoken.get_encoding(args.encoding)
+            except Exception as e:
+                logger.warning("tiktoken unavailable or failed to load (%s); using heuristic.", e)
+                encoder = None
+
+        for ws in wb.worksheets:
+            sheet_chars = 0
+            sheet_words = 0
+            sheet_cells_with_text = 0
+            sheet_tokens = 0
+            for row in ws.iter_rows(values_only=True):
+                for value in row:
+                    if isinstance(value, str) and value:
+                        sheet_cells_with_text += 1
+                        sheet_chars += len(value)
+                        sheet_words += len(value.split())
+                        if encoder:
+                            try:
+                                sheet_tokens += len(encoder.encode(value))
+                            except Exception:
+                                sheet_tokens += _estimate_tokens_heuristic(value)
+                        else:
+                            sheet_tokens += _estimate_tokens_heuristic(value)
+            per_sheet.append({
+                "sheet": ws.title,
+                "num_cells_with_text": sheet_cells_with_text,
+                "num_chars": sheet_chars,
+                "num_words": sheet_words,
+                "est_tokens": sheet_tokens,
+            })
+            total_cells_with_text += sheet_cells_with_text
+            total_chars += sheet_chars
+            total_words += sheet_words
+            total_tokens += sheet_tokens
+
+        report = {
+            "file": str(args.xlsx),
+            "sheets": per_sheet,
+            "totals": {
+                "total_cells_with_text": total_cells_with_text,
+                "total_chars": total_chars,
+                "total_words": total_words,
+                "total_est_tokens": total_tokens,
+            },
+            "token_method": "tiktoken" if encoder else "heuristic_4chars_per_token",
+        }
+        out_json_path = Path(args.out_json)
+        out_json_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"Text stats JSON saved: {out_json_path}")
+        sys.exit(0)
+
+    # Default: images workflow (backward compatible)
+    xlsx_path = getattr(args, "xlsx", None)
+    output_dir = getattr(args, "out", None)
+    if not xlsx_path or not output_dir:
+        print("Usage (images): Docs_Analyzer.py images --xlsx <file.xlsx> --out <export_dir> [--out-json <report.json>] [--json]")
+        print("Usage (text):   Docs_Analyzer.py text-stats --xlsx <file.xlsx> --out-json <report.json> [--use-tiktoken] [--encoding cl100k_base]")
+        sys.exit(2)
 
     results = extract_images_xlsx(xlsx_path, output_dir)
 
