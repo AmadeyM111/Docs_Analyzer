@@ -1,0 +1,19 @@
+{
+  "file": "Заказ ПрофиПолиграфия.xlsx",
+  "sheets": [
+    {
+      "sheet": "Заказ",
+      "num_cells_with_text": 233,
+      "num_chars": 4353,
+      "num_words": 743,
+      "est_tokens": 1102
+    }
+  ],
+  "totals": {
+    "total_cells_with_text": 233,
+    "total_chars": 4353,
+    "total_words": 743,
+    "total_est_tokens": 1102
+  },
+  "token_method": "heuristic_4chars_per_token"
+}

@@ -9,6 +9,7 @@ import json
 import sys
 import hashlib
 import os
+import base64
 
 try:
     from PIL import Image, ExifTags  # type: ignore
@@ -20,11 +21,11 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
-def _estimate_tokens_heuristic(text: str) -> int:
-    # Rough heuristic: ~4 characters per token (English-centric; configurable)
+def _estimate_tokens_heuristic(text: str, chars_per_token: float = 3.0) -> int:
+    # Rough heuristic: configurable characters per token (default: 3 chars = 1 token)
     if not text:
         return 0
-    return max(1, int(len(text) / 4))
+    return max(1, int(len(text) / chars_per_token))
 
 
 def _compute_sha256(file_path: Path) -> str:
@@ -221,12 +222,6 @@ def parse_args(argv):
         help="Save text statistics to the specified JSON file",
     )
     text_stats.add_argument(
-        "--image-bytes-per-token",
-        type=float,
-        default=0.0,
-        help="Optional: conversion rate to estimate image tokens from bytes (e.g., 3.0). 0 disables estimation.",
-    )
-    text_stats.add_argument(
         "--use-tiktoken",
         action="store_true",
         help="Use tiktoken for token counting (fallback to heuristic if not available)",
@@ -235,6 +230,12 @@ def parse_args(argv):
         "--encoding",
         default="cl100k_base",
         help="tiktoken encoding name (default: cl100k_base)",
+    )
+    text_stats.add_argument(
+        "--chars-per-token",
+        type=float,
+        default=3.0,
+        help="Characters per token for heuristic estimation (default: 3.0, i.e., 3 chars = 1 token)",
     )
 
     # If no subcommand provided, maintain backward compatibility with images mode
@@ -278,6 +279,7 @@ if __name__ == "__main__":
         # Image bytes from xl/media without extracting
         total_image_files = 0
         total_image_bytes = 0
+        total_image_tokens = 0
 
         encoder = None
         if getattr(args, "use_tiktoken", False):
@@ -287,6 +289,8 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.warning("tiktoken unavailable or failed to load (%s); using heuristic.", e)
                 encoder = None
+
+        chars_per_token = getattr(args, "chars_per_token", 3.0)
 
         for ws in wb.worksheets:
             sheet_chars = 0
@@ -303,9 +307,9 @@ if __name__ == "__main__":
                             try:
                                 sheet_tokens += len(encoder.encode(value))
                             except Exception:
-                                sheet_tokens += _estimate_tokens_heuristic(value)
+                                sheet_tokens += _estimate_tokens_heuristic(value, chars_per_token)
                         else:
-                            sheet_tokens += _estimate_tokens_heuristic(value)
+                            sheet_tokens += _estimate_tokens_heuristic(value, chars_per_token)
             per_sheet.append({
                 "sheet": ws.title,
                 "num_cells_with_text": sheet_cells_with_text,
@@ -318,7 +322,7 @@ if __name__ == "__main__":
             total_words += sheet_words
             total_tokens += sheet_tokens
 
-        # Accumulate image bytes from the XLSX archive's xl/media directory
+        # Process images: convert to base64 and count tokens using the same method as text
         try:
             with zipfile.ZipFile(args.xlsx) as zf:
                 media_names = [n for n in zf.namelist() if n.startswith("xl/media/")]
@@ -326,15 +330,31 @@ if __name__ == "__main__":
                     try:
                         info = zf.getinfo(name)
                         total_image_files += 1
-                        total_image_bytes += getattr(info, "file_size", 0)
+                        image_bytes = zf.read(name)
+                        total_image_bytes += len(image_bytes)
+                        
+                        # Convert image bytes to base64 string
+                        base64_str = base64.b64encode(image_bytes).decode('utf-8')
+                        base64_chars = len(base64_str)
+                        
+                        # Count tokens for base64 string using the same method as text
+                        if encoder:
+                            try:
+                                image_tokens = len(encoder.encode(base64_str))
+                            except Exception:
+                                image_tokens = _estimate_tokens_heuristic(base64_str, chars_per_token)
+                        else:
+                            image_tokens = _estimate_tokens_heuristic(base64_str, chars_per_token)
+                        
+                        total_image_tokens += image_tokens
+                        logger.debug("Image %s: %d bytes, %d base64 chars, %d tokens", name, len(image_bytes), base64_chars, image_tokens)
                     except KeyError:
                         continue
+                    except Exception as e:
+                        logger.warning("Failed to process image %s: %s", name, e)
+                        continue
         except Exception as e:
-            logger.warning("Failed to inspect xl/media for image bytes: %s", e)
-
-        est_image_tokens = None
-        if args.image_bytes_per_token and args.image_bytes_per_token > 0:
-            est_image_tokens = int(total_image_bytes / args.image_bytes_per_token)
+            logger.warning("Failed to inspect xl/media for images: %s", e)
 
         report = {
             "file": str(args.xlsx),
@@ -348,15 +368,15 @@ if __name__ == "__main__":
             "images": {
                 "total_image_files": total_image_files,
                 "total_image_bytes": total_image_bytes,
-                "est_image_tokens": est_image_tokens,
-                "image_bytes_per_token": args.image_bytes_per_token if args.image_bytes_per_token else None,
+                "est_image_tokens": total_image_tokens if total_image_files > 0 else None,
+                "token_calculation_method": "base64_encoded_then_tokenized",
             },
             "totals_overall": {
                 "total_est_tokens_text": total_tokens,
-                "total_est_image_tokens": est_image_tokens,
-                "total_est_tokens_combined": (total_tokens + (est_image_tokens or 0)),
+                "total_est_image_tokens": total_image_tokens,
+                "total_est_tokens_combined": (total_tokens + total_image_tokens),
             },
-            "token_method": "tiktoken" if encoder else "heuristic_4chars_per_token",
+            "token_method": "tiktoken" if encoder else f"heuristic_{chars_per_token}chars_per_token",
         }
         out_json_path = Path(args.out_json)
         out_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -370,7 +390,7 @@ if __name__ == "__main__":
     output_dir = getattr(args, "out", None)
     if not xlsx_path or not output_dir:
         print("Usage (images): Docs_Analyzer.py images --xlsx <file.xlsx> --out <export_dir> [--out-json <report.json>] [--json]")
-        print("Usage (text):   Docs_Analyzer.py text-stats --xlsx <file.xlsx> --out-json <report.json> [--use-tiktoken] [--encoding cl100k_base]")
+        print("Usage (text):   Docs_Analyzer.py text-stats --xlsx <file.xlsx> --out-json <report.json> [--use-tiktoken] [--encoding cl100k_base] [--chars-per-token 3.0]")
         sys.exit(2)
 
     results = extract_images_xlsx(xlsx_path, output_dir)
